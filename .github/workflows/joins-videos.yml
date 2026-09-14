@@ -1,0 +1,129 @@
+name: 🎬 Lossless Video Joiner from Google Drive
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_urls:
+        description: 'Google Drive URL(s) or Folder Link (paste one or more links, or folder link)'
+        required: true
+        type: string
+        default: 'example_links.txt'
+      output_filename:
+        description: 'Output Merged Video Filename'
+        required: true
+        type: string
+        default: 'merged_video.mp4'
+      join_mode:
+        description: 'Join Mode: auto (smart lossless copy), copy (force 100% stream copy), transcode (visually lossless)'
+        required: true
+        type: choice
+        default: 'auto'
+        options:
+          - auto
+          - copy
+          - transcode
+      sort_order:
+        description: 'File Sorting Order'
+        required: false
+        type: choice
+        default: 'natural'
+        options:
+          - natural
+          - alphabetical
+          - date
+          - none
+      upload_release:
+        description: 'Create a GitHub Release with the merged video for direct public download?'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  download-and-merge:
+    name: Download & Merge Losslessly
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🎬 Setup FFmpeg & FFprobe
+        uses: FedericoCarboni/setup-ffmpeg@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+        id: setup-ffmpeg
+
+      - name: 🐍 Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 📦 Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 🚀 Download from Google Drive & Merge Losslessly
+        env:
+          INPUT_URLS: ${{ inputs.video_urls }}
+          OUTPUT_NAME: ${{ inputs.output_filename }}
+          JOIN_MODE: ${{ inputs.join_mode }}
+          SORT_ORDER: ${{ inputs.sort_order }}
+          CI: 'true'
+        run: |
+          echo "========================================================"
+          echo "🎬 Starting Google Drive Lossless Video Joiner Workflow"
+          echo "Output Target: $OUTPUT_NAME"
+          echo "Join Mode:     $JOIN_MODE"
+          echo "Sort Order:    $SORT_ORDER"
+          echo "========================================================"
+          
+          # Check if INPUT_URLS points to an existing file in the repository (e.g. example_links.txt)
+          if [ -f "$INPUT_URLS" ]; then
+            echo "📄 Reading links from file: $INPUT_URLS"
+            python -u video_joiner.py \
+              -g "$INPUT_URLS" \
+              -o "$OUTPUT_NAME" \
+              -m "$JOIN_MODE" \
+              --sort "$SORT_ORDER" \
+              --clean-downloads \
+              -y
+          else
+            echo "🌐 Downloading directly from provided Google Drive URL(s)..."
+            python -u video_joiner.py \
+              --urls "$INPUT_URLS" \
+              -o "$OUTPUT_NAME" \
+              -m "$JOIN_MODE" \
+              --sort "$SORT_ORDER" \
+              --clean-downloads \
+              -y
+          fi
+
+      - name: 📤 Upload Merged Video Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.output_filename }}
+          path: ${{ inputs.output_filename }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 🚀 Publish GitHub Release (Optional)
+        if: ${{ inputs.upload_release == true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: merge-run-${{ github.run_id }}
+          name: Merged Video - ${{ inputs.output_filename }}
+          files: ${{ inputs.output_filename }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## 🎬 Lossless Video Joiner Output
+            - **Filename:** `${{ inputs.output_filename }}`
+            - **Workflow Run:** [#${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            - **Join Mode:** `${{ inputs.join_mode }}`
+            - **Quality:** 100% Intact Quality (Zero Re-encoding Stream Copy where matching)
