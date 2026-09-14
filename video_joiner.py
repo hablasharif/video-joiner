@@ -393,21 +393,34 @@ def download_with_gdown(url_or_id: str, dest_dir: Path, index: int = 1) -> Path:
     dest_param = str(dest_dir.resolve()) + os.sep
     
     res = None
+    err_notes = []
     try:
-        res = gdown.download(url=url, output=dest_param, quiet=False, fuzzy=True)
-    except Exception:
-        pass
+        res = gdown.download(url=url, output=dest_param, quiet=False)
+    except Exception as e:
+        err_notes.append(str(e))
+        
     if (not res or not Path(res).is_file()) and file_id:
         try:
-            res = gdown.download(id=file_id, output=dest_param, quiet=False, fuzzy=True)
-        except Exception:
-            pass
+            res = gdown.download(id=file_id, output=dest_param, quiet=False)
+        except Exception as e:
+            err_notes.append(str(e))
+            
     if not res or not Path(res).is_file():
         fallback = dest_dir / f"video_{index:02d}.mp4"
-        res = gdown.download(url=url, output=str(fallback), quiet=False, fuzzy=True)
+        try:
+            res = gdown.download(url=url, output=str(fallback), quiet=False)
+        except Exception as e:
+            err_notes.append(str(e))
         
     if not res or not Path(res).is_file():
-        raise RuntimeError(f"Failed to download Google Drive file: {url_or_id}")
+        full_err = " | ".join(err_notes)
+        if "Cannot retrieve the public link" in full_err or "permission" in full_err.lower():
+            raise PermissionError(
+                f"Google Drive access restricted for: {url_or_id}\n"
+                f"File is PRIVATE or requires Google Sign-in.\n"
+                f"👉 Fix: In Google Drive, right-click file -> Share -> Change 'General access' to 'Anyone with the link' (Viewer)."
+            )
+        raise RuntimeError(f"gdown could not retrieve file: {url_or_id} ({full_err})")
     return ensure_video_extension(Path(res).resolve())
 
 
@@ -439,43 +452,110 @@ def download_gdrive_folder(url: str, dest_dir: Path) -> List[Path]:
 
 
 def download_with_requests(url_or_id: str, dest_dir: Path, index: int = 1) -> Path:
-    """Download Google Drive file using requests with token handling."""
+    """Download Google Drive file using requests with token handling and permission validation."""
     if not requests:
         raise ImportError("requests is required for downloading.")
     file_id = extract_gdrive_id(url_or_id)
-    download_url = "https://docs.google.com/uc?export=download" if file_id else url_or_id
+    download_url = f"https://drive.google.com/uc?id={file_id}&export=download" if file_id else url_or_id
     session = requests.Session()
-    params = {"id": file_id} if file_id else {}
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VideoJoiner/1.0"}
     
-    resp = session.get(download_url, params=params, headers=headers, stream=True)
-    token = None
-    for k, v in resp.cookies.items():
-        if k.startswith("download_warning"):
-            token = v
-            break
-    if not token and resp.text:
-        m = re.search(r'confirm=([0-9A-Za-z_]+)', resp.text)
-        if m:
-            token = m.group(1)
-    if token:
-        params["confirm"] = token
-        resp = session.get(download_url, params=params, headers=headers, stream=True)
+    resp = session.get(download_url, headers=headers, stream=True, allow_redirects=True)
+
+    # Check for authentication redirect (Restricted / Private file)
+    if "accounts.google.com" in resp.url or "/signin" in resp.url or "ServiceLogin" in resp.url:
+        raise PermissionError(
+            f"Google Drive access restricted for: {url_or_id}\n"
+            f"File is PRIVATE or requires Google Sign-in.\n"
+            f"👉 Fix: In Google Drive, right-click file -> Share -> Change 'General access' to 'Anyone with the link' (Viewer)."
+        )
+
+    content_type = resp.headers.get("content-type", "").lower()
+    if "text/html" in content_type:
+        html_text = next(resp.iter_content(65536), b"").decode("utf-8", errors="replace")
+
+        # 1. Check for sign-in / restricted access
+        if "accounts.google.com" in resp.url or "accounts.google.com" in html_text or "ServiceLogin" in html_text:
+            raise PermissionError(
+                f"Google Drive access restricted for: {url_or_id}\n"
+                f"File is PRIVATE or requires Google Sign-in.\n"
+                f"👉 Fix: In Google Drive, right-click file -> Share -> Change 'General access' to 'Anyone with the link' (Viewer)."
+            )
+
+        # 2. Check for quota exceeded
+        if "quota" in html_text.lower() or "too many users" in html_text.lower():
+            raise RuntimeError(f"Google Drive download quota exceeded for: {url_or_id}")
+
+        # 3. Check for Google Drive Virus Scan Warning form (for files > 100MB)
+        # Google provides a <form id="download-form" action="https://drive.usercontent.google.com/download" method="get">
+        # with hidden inputs: id, export, confirm, uuid
+        form_inputs = {}
+        for m in re.finditer(r'<input[^>]+name="([^"]+)"[^>]+value="([^"]*)"', html_text):
+            form_inputs[m.group(1)] = m.group(2)
+
+        action_match = re.search(r'<form[^>]+action="([^"]+)"', html_text)
+        action_url = action_match.group(1) if action_match else "https://drive.usercontent.google.com/download"
+
+        if form_inputs and "confirm" in form_inputs:
+            resp = session.get(action_url, params=form_inputs, headers=headers, stream=True, allow_redirects=True)
+        else:
+            # Fallback legacy token search
+            m_token = re.search(r'confirm=([0-9A-Za-z_-]+)', html_text)
+            if m_token and file_id:
+                token = m_token.group(1)
+                confirm_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm={token}"
+                resp = session.get(confirm_url, headers=headers, stream=True, allow_redirects=True)
+            else:
+                raise RuntimeError(
+                    f"Google Drive returned an HTML page instead of video data for: {url_or_id}\n"
+                    f"Please verify the file sharing permission is set to 'Anyone with the link'."
+                )
         
     cd = resp.headers.get("content-disposition", "")
     filename = None
     if cd:
-        m = re.search(r'filename="?([^";]+)"?', cd)
+        m = re.search(r'filename\*=UTF-8\'\'([^;]+)', cd, re.IGNORECASE)
         if m:
-            filename = m.group(1).strip()
+            filename = urllib.parse.unquote(m.group(1))
+        else:
+            m2 = re.search(r'filename="?([^";]+)"?', cd)
+            if m2:
+                filename = m2.group(1).strip()
     if not filename:
-        filename = f"drive_video_{index:02d}.mp4"
+        parsed = urllib.parse.urlparse(url_or_id)
+        path_name = os.path.basename(parsed.path)
+        if path_name and "." in path_name:
+            filename = path_name
+        else:
+            filename = f"drive_video_{index:02d}.mp4"
         
     dest_path = dest_dir / filename
-    with open(dest_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=128 * 1024):
-            if chunk:
-                f.write(chunk)
+    try:
+        with open(dest_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=128 * 1024):
+                if chunk:
+                    f.write(chunk)
+    except Exception:
+        if dest_path.exists():
+            dest_path.unlink(missing_ok=True)
+        raise
+
+    # Ensure file is not empty and not HTML
+    if not dest_path.is_file() or dest_path.stat().st_size == 0:
+        if dest_path.exists():
+            dest_path.unlink(missing_ok=True)
+        raise RuntimeError(f"Download produced an empty file (0 bytes): {url_or_id}")
+
+    with open(dest_path, "rb") as f:
+        magic = f.read(512)
+    if magic.strip().startswith(b"<!DOCTYPE") or magic.strip().startswith(b"<html") or b"<head>" in magic.lower():
+        dest_path.unlink(missing_ok=True)
+        raise PermissionError(
+            f"Google Drive returned an HTML page instead of video data for: {url_or_id}\n"
+            f"The file is PRIVATE or requires Google account sign-in.\n"
+            f"👉 Fix: Set file sharing to 'Anyone with the link' (Viewer) in Google Drive."
+        )
+
     return ensure_video_extension(dest_path)
 
 
@@ -483,28 +563,54 @@ def download_video(url_or_id: str, dest_dir: Path, index: int = 1) -> Path:
     """Download a video using gdown with requests fallback."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     file_id = extract_gdrive_id(url_or_id)
+    last_err: Optional[Exception] = None
     if gdown and file_id:
         try:
             return download_with_gdown(url_or_id, dest_dir, index=index)
-        except Exception:
-            pass
-    return download_with_requests(url_or_id, dest_dir, index=index)
+        except PermissionError:
+            raise
+        except Exception as e:
+            last_err = e
+            print(f"⚠️ gdown attempt note: {e}, falling back to requests session...")
+    try:
+        return download_with_requests(url_or_id, dest_dir, index=index)
+    except Exception as req_err:
+        if last_err and isinstance(req_err, PermissionError):
+            raise req_err
+        raise req_err
 
 
 def download_all_videos(urls: List[str], dest_dir: Path) -> List[Path]:
     """Download all videos from URLs (files or folders)."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     downloaded = []
+    failed_downloads = []
     total = len(urls)
     for i, u in enumerate(urls, start=1):
         if is_gdrive_folder(u):
-            folder_vids = download_gdrive_folder(u, dest_dir)
-            downloaded.extend(folder_vids)
+            try:
+                folder_vids = download_gdrive_folder(u, dest_dir)
+                downloaded.extend(folder_vids)
+            except Exception as e:
+                failed_downloads.append((u, str(e)))
         else:
             print(f"📥 Downloading [{i}/{total}]: {u}")
-            p = download_video(u, dest_dir, index=len(downloaded) + 1)
-            if p and p.is_file() and p not in downloaded:
-                downloaded.append(p)
+            try:
+                p = download_video(u, dest_dir, index=len(downloaded) + 1)
+                if p and p.is_file() and p not in downloaded:
+                    downloaded.append(p)
+            except Exception as e:
+                print(f"❌ Error downloading [{i}/{total}]: {e}")
+                failed_downloads.append((u, str(e)))
+
+    if failed_downloads:
+        print("\n" + "=" * 62)
+        print("❌ DOWNLOAD ERRORS DETECTED:")
+        for u, err in failed_downloads:
+            print(f"  • {u}\n    {err}")
+        print("=" * 62 + "\n")
+        raise RuntimeError(f"{len(failed_downloads)} download(s) failed. See error details above.")
+
     return downloaded
 
 
