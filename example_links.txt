@@ -1,0 +1,17 @@
+# 🎬 Example Google Drive Links for Video Joiner
+# Place one Google Drive link (or direct video URL) per line.
+# Lines starting with '#' are ignored as comments.
+# Supported formats:
+#   - https://drive.google.com/file/d/<FILE_ID>/view?usp=sharing
+#   - https://drive.google.com/open?id=<FILE_ID>
+#   - https://drive.google.com/uc?id=<FILE_ID>&export=download
+#   - Direct raw File IDs
+
+# Part 1
+https://drive.google.com/file/d/1ExampleFileIdPart1XXXXXXXXXXX/view?usp=sharing
+
+# Part 2
+https://drive.google.com/file/d/1ExampleFileIdPart2YYYYYYYYYYY/view?usp=sharing
+
+# Part 3
+https://drive.google.com/file/d/1ExampleFileIdPart3ZZZZZZZZZZZ/view?usp=sharing

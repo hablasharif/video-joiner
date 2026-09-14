@@ -1,0 +1,4 @@
+# Dependencies for Google Drive downloading & lossless video joining
+# Optimized for GitHub Actions, Linux runners, and CLI
+gdown>=5.2.0
+requests>=2.28.0
